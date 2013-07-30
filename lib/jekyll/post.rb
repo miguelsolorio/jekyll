@@ -10,6 +10,24 @@ module Jekyll
     # Valid post name regex.
     MATCHER = /^(.+\/)*(\d+-\d+-\d+)-(.*)(\.[^.]+)$/
 
+    EXCERPT_ATTRIBUTES_FOR_LIQUID = %w[
+      title
+      url
+      date
+      id
+      categories
+      next
+      previous
+      tags
+      path
+    ]
+
+    # Attributes for Liquid templates
+    ATTRIBUTES_FOR_LIQUID = EXCERPT_ATTRIBUTES_FOR_LIQUID.concat(%w[
+      content
+      excerpt
+    ])
+
     # Post name validator. Post filenames must be like:
     # 2008-11-05-my-awesome-post.textile
     #
@@ -39,33 +57,35 @@ module Jekyll
 
       self.categories = dir.downcase.split('/').reject { |x| x.empty? }
       self.process(name)
-      begin
-        self.read_yaml(@base, name)
-      rescue Exception => msg
-        raise FatalException.new("#{msg} in #{@base}/#{name}")
-      end
+      self.read_yaml(@base, name)
 
-      # If we've added a date and time to the YAML, use that instead of the
-      # filename date. Means we'll sort correctly.
       if self.data.has_key?('date')
-        # ensure Time via to_s and reparse
         self.date = Time.parse(self.data["date"].to_s)
       end
 
+      self.published = self.published?
+
+      self.populate_categories
+      self.populate_tags
+    end
+
+    def published?
       if self.data.has_key?('published') && self.data['published'] == false
-        self.published = false
+        false
       else
-        self.published = true
+        true
       end
+    end
 
-      self.tags = self.data.pluralized_array("tag", "tags")
-
+    def populate_categories
       if self.categories.empty?
-        self.categories = self.data.pluralized_array('category', 'categories').map {|c| c.downcase}
+        self.categories = self.data.pluralized_array('category', 'categories').map {|c| c.to_s.downcase}
       end
-
-      self.tags.flatten!
       self.categories.flatten!
+    end
+
+    def populate_tags
+      self.tags = self.data.pluralized_array("tag", "tags").flatten
     end
 
     # Get the full path to the directory containing the post files
@@ -92,8 +112,25 @@ module Jekyll
       if self.data.has_key? 'excerpt'
         self.data['excerpt']
       else
-        self.extracted_excerpt
+        self.extracted_excerpt.to_s
       end
+    end
+
+    # Public: the Post title, from the YAML Front-Matter or from the slug
+    #
+    # Returns the post title
+    def title
+      self.data["title"] || self.slug.split('-').select {|w| w.capitalize! || w }.join(' ')
+    end
+
+    # Public: the path to the post relative to the site source,
+    #         from the YAML Front-Matter or from a combination of
+    #         the directory it's in, "_posts", and the name of the
+    #         post file
+    #
+    # Returns the path to the file relative to the site source
+    def path
+      self.data['path'] || File.join(@dir, '_posts', @name).sub(/\A\//, '')
     end
 
     # Compares Post objects. First compares the Post date. If the dates are
@@ -122,14 +159,6 @@ module Jekyll
       self.ext = ext
     rescue ArgumentError
       raise FatalException.new("Post #{name} does not have a valid date.")
-    end
-
-    # Transform the contents and excerpt based on the content type.
-    #
-    # Returns nothing.
-    def transform
-      super
-      self.extracted_excerpt = converter.convert(self.extracted_excerpt)
     end
 
     # The generated directory into which the post will be placed
@@ -194,6 +223,7 @@ module Jekyll
       # sanitize url
       @url = url.split('/').reject{ |part| part =~ /^\.+$/ }.join('/')
       @url += "/" if url =~ /\/$/
+      @url.gsub!(/\A([^\/])/, '/\1')
       @url
     end
 
@@ -209,25 +239,7 @@ module Jekyll
     #
     # Returns an Array of related Posts.
     def related_posts(posts)
-      return [] unless posts.size > 1
-
-      if self.site.lsi
-        self.class.lsi ||= begin
-          puts "Starting the classifier..."
-          lsi = Classifier::LSI.new(:auto_rebuild => false)
-          $stdout.print("  Populating LSI... ");$stdout.flush
-          posts.each { |x| $stdout.print(".");$stdout.flush;lsi.add_item(x) }
-          $stdout.print("\n  Rebuilding LSI index... ")
-          lsi.build_index
-          puts ""
-          lsi
-        end
-
-        related = self.class.lsi.find_related(self.content, 11)
-        related - [self]
-      else
-        (posts - [self])[0..9]
-      end
+      Jekyll::RelatedPosts.new(self).build
     end
 
     # Add any necessary layouts to this post.
@@ -240,10 +252,12 @@ module Jekyll
       # construct payload
       payload = {
         "site" => { "related_posts" => related_posts(site_payload["site"]["posts"]) },
-        "page" => self.to_liquid
+        "page" => self.to_liquid(EXCERPT_ATTRIBUTES_FOR_LIQUID)
       }.deep_merge(site_payload)
 
-      do_layout(payload, layouts)
+      self.extracted_excerpt.do_layout(payload, {})
+
+      do_layout(payload.merge({"page" => self.to_liquid}), layouts)
     end
 
     # Obtain destination path.
@@ -258,35 +272,14 @@ module Jekyll
       path
     end
 
-    # Write the generated post file to the destination directory.
-    #
-    # dest - The String path to the destination dir.
-    #
-    # Returns nothing.
-    def write(dest)
-      path = destination(dest)
-      FileUtils.mkdir_p(File.dirname(path))
-      File.open(path, 'w') do |f|
-        f.write(self.output)
-      end
-    end
-
     # Convert this post into a Hash for use in Liquid templates.
     #
     # Returns the representative Hash.
-    def to_liquid
-      self.data.deep_merge({
-        "title"      => self.data["title"] || self.slug.split('-').select {|w| w.capitalize! || w }.join(' '),
-        "url"        => self.url,
-        "date"       => self.date,
-        "id"         => self.id,
-        "categories" => self.categories,
-        "next"       => self.next,
-        "previous"   => self.previous,
-        "tags"       => self.tags,
-        "content"    => self.content,
-        "excerpt"    => self.excerpt,
-        "path"       => self.data['path'] || File.join(@dir, '_posts', @name).sub(/\A\//, '') })
+    def to_liquid(attrs = ATTRIBUTES_FOR_LIQUID)
+      further_data = Hash[attrs.map { |attribute|
+        [attribute, send(attribute)]
+      }]
+      data.deep_merge(further_data)
     end
 
     # Returns the shorthand String identifier of this Post.
@@ -315,45 +308,8 @@ module Jekyll
 
     protected
 
-    # Internal: Extract excerpt from the content
-    #
-    # By default excerpt is your first paragraph of a post: everything before
-    # the first two new lines:
-    #
-    #     ---
-    #     title: Example
-    #     ---
-    #
-    #     First paragraph with [link][1].
-    #
-    #     Second paragraph.
-    #
-    #     [1]: http://example.com/
-    #
-    # This is fairly good option for Markdown and Textile files. But might cause
-    # problems for HTML posts (which is quite unusual for Jekyll). If default
-    # excerpt delimiter is not good for you, you might want to set your own via
-    # configuration option `excerpt_separator`. For example, following is a good
-    # alternative for HTML posts:
-    #
-    #     # file: _config.yml
-    #     excerpt_separator: "<!-- more -->"
-    #
-    # Notice that all markdown-style link references will be appended to the
-    # excerpt. So the example post above will have this excerpt source:
-    #
-    #     First paragraph with [link][1].
-    #
-    #     [1]: http://example.com/
-    #
-    # Excerpts are rendered same time as content is rendered.
-    #
-    # Returns excerpt String
     def extract_excerpt
-      separator     = self.site.config['excerpt_separator']
-      head, _, tail = self.content.partition(separator)
-
-      "" << head << "\n\n" << tail.scan(/^\[[^\]]+\]:.+$/).join("\n")
+      Jekyll::Excerpt.new(self)
     end
   end
 end

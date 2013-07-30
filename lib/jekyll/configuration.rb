@@ -1,8 +1,10 @@
+# encoding: UTF-8
+
 module Jekyll
   class Configuration < Hash
 
-    # Default options. Overriden by values in _config.yml.
-    # Strings rather than symbols are used for compatability with YAML.
+    # Default options. Overridden by values in _config.yml.
+    # Strings rather than symbols are used for compatibility with YAML.
     DEFAULTS = {
       'source'        => Dir.pwd,
       'destination'   => File.join(Dir.pwd, '_site'),
@@ -14,17 +16,20 @@ module Jekyll
 
       'safe'          => false,
       'show_drafts'   => nil,
-      'limit_posts'   => nil,
+      'limit_posts'   => 0,
       'lsi'           => false,
       'future'        => true,           # remove and make true just default
-      'pygments'      => true,           # remove and make true just default
+      'pygments'      => true,
+
+      'relative_permalinks' => true,     # backwards-compatibility with < 1.0
+                                         # will be set to false once 1.1 hits
 
       'markdown'      => 'maruku',
       'permalink'     => 'date',
       'baseurl'       => '/',
       'include'       => ['.htaccess'],
       'exclude'       => [],
-      'paginate_path' => 'page:num',
+      'paginate_path' => '/page:num',
 
       'markdown_ext'  => 'markdown,mkd,mkdn,md',
       'textile_ext'   => 'textile',
@@ -97,7 +102,10 @@ module Jekyll
     def config_files(override)
       # Get configuration from <source>/_config.yml or <source>/<config_file>
       config_files = override.delete('config')
-      config_files = File.join(source(override), "_config.yml") if config_files.to_s.empty?
+      if config_files.to_s.empty?
+        config_files = File.join(source(override), "_config.yml")
+        @default_config_file = true
+      end
       config_files = [config_files] unless config_files.is_a? Array
       config_files
     end
@@ -109,9 +117,17 @@ module Jekyll
     # Returns this configuration, overridden by the values in the file
     def read_config_file(file)
       next_config = YAML.safe_load_file(file)
-      raise "Configuration file: (INVALID) #{file}".yellow if !next_config.is_a?(Hash)
-      Jekyll::Logger.info "Configuration file:", file
+      raise ArgumentError.new("Configuration file: (INVALID) #{file}".yellow) if !next_config.is_a?(Hash)
+      Jekyll.logger.info "Configuration file:", file
       next_config
+    rescue SystemCallError
+      if @default_config_file
+        Jekyll.logger.warn "Configuration file:", "none"
+        {}
+      else
+        Jekyll.logger.error "Fatal:", "The configuration file '#{file}' could not be found."
+        raise LoadError
+      end
     end
 
     # Public: Read in a list of configuration files and merge with this hash
@@ -128,16 +144,22 @@ module Jekyll
           new_config = read_config_file(config_file)
           configuration = configuration.deep_merge(new_config)
         end
-      rescue SystemCallError
-        # Errno:ENOENT = file not found
-        Jekyll::Logger.warn "Configuration file:", "none"
-      rescue => err
-        Jekyll::Logger.warn "WARNING:", "Error reading configuration. " +
+      rescue ArgumentError => err
+        Jekyll.logger.warn "WARNING:", "Error reading configuration. " +
                      "Using defaults (and options)."
         $stderr.puts "#{err}"
       end
 
       configuration.backwards_compatibilize
+    end
+
+    # Public: Split a CSV string into an array containing its values
+    #
+    # csv - the string of comma-separated values
+    #
+    # Returns an array of the values contained in the CSV
+    def csv_to_array(csv)
+      csv.split(",").map(&:strip)
     end
 
     # Public: Ensure the proper options are set in the configuration to allow for
@@ -148,7 +170,7 @@ module Jekyll
       config = clone
       # Provide backwards-compatibility
       if config.has_key?('auto') || config.has_key?('watch')
-        Jekyll::Logger.warn "Deprecation:", "Auto-regeneration can no longer" +
+        Jekyll.logger.warn "Deprecation:", "Auto-regeneration can no longer" +
                             " be set from your configuration file(s). Use the"+
                             " --watch/-w command-line option instead."
         config.delete('auto')
@@ -156,12 +178,30 @@ module Jekyll
       end
 
       if config.has_key? 'server'
-        Jekyll::Logger.warn "Deprecation:", "The 'server' configuration option" +
+        Jekyll.logger.warn "Deprecation:", "The 'server' configuration option" +
                             " is no longer accepted. Use the 'jekyll serve'" +
                             " subcommand to serve your site with WEBrick."
         config.delete('server')
       end
 
+      if config.has_key? 'server_port'
+        Jekyll.logger.warn "Deprecation:", "The 'server_port' configuration option" +
+                            " has been renamed to 'port'. Please update your config" +
+                            " file accordingly."
+        # copy but don't overwrite:
+        config['port'] = config['server_port'] unless config.has_key?('port')
+        config.delete('server_port')
+      end
+
+      %w[include exclude].each do |option|
+        if config.fetch(option, []).is_a?(String)
+          Jekyll.logger.warn "Deprecation:", "The '#{option}' configuration option" +
+            " must now be specified as an array, but you specified" +
+            " a string. For now, we've treated the string you provided" +
+            " as a list of comma-separated values."
+          config[option] = csv_to_array(config[option])
+        end
+      end
       config
     end
 
